@@ -1,0 +1,49 @@
+============================================================
+DUV AR Coating Optimization Summary Report
+============================================================
+
+1. Optimization Settings
+------------------------------
+Algorithm: NSGA-II
+Population Size: 400
+Generations: 1000
+Design Variables: 7 (layer thicknesses)
+Objectives: 5 (avg R, uniformity, high-angle R, temp stability, stress)
+
+2. Solution Selection Weights
+------------------------------
+  Avg Reflectance: 0.350
+  Uniformity: 0.450
+  Max High-Angle R: 0.100
+  Temp Stability: 0.050
+  Avg Stress: 0.050
+
+3. Best Solution Performance
+------------------------------
+Average Reflectance (20°C): 1.3633%
+Reflectance Uniformity:     9.5037%
+Max High-Angle (>40°) R:    1.5749%
+Temperature Stability ΔR:   0.0019%
+Average Film Stress:         39.23 MPa
+
+4. Optimal Layer Thicknesses
+------------------------------
+  Layer 1 (LaF3): 53.7 nm
+  Layer 2 (MgF2): 30.1 nm
+  Layer 3 (LaF3): 50.0 nm
+  Layer 4 (MgF2): 23.2 nm
+  Layer 5 (LaF3): 47.9 nm
+  Layer 6 (MgF2): 58.4 nm
+  Layer 7 (LaF3): 124.5 nm
+
+5. Manufacturing Feasibility
+------------------------------
+✓ Adjacent-layer thickness difference ≥ 4 nm (constraint satisfied)
+✓ Thickness range 20–200 nm (e-beam evaporation compatible)
+✓ Weighted stress target met
+
+6. Data Sources
+------------------------------
+Material: Jenoptik DUV Coating Technical Datasheet
+Substrate: High-NA Lithography Lens Spec (ASML)
+Simulation: TMM @ 193 nm single wavelength
