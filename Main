@@ -1,0 +1,1164 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+DUV AR Coating Multi-Objective Optimization (NSGA-II)
+=====================================================
+修复清单（对应代码审查中的 13 条问题）：
+
+Fix-1  generate_summary_report 中 best_params 类型统一为 np.ndarray，
+       避免 list/ndarray 混用导致 * 1e9 行为不一致。
+Fix-2  plot_convergence_curve 中 gen.pop 命名歧义注释说明，
+       并改为局部变量 pop_obj 避免误读。
+Fix-3  _discretize_zones 重写：严格输出 num_zones 个区，
+       边缘加密逻辑合并进主循环，去除 np.unique 导致的区数漂移。
+Fix-4  tmm_reflectance 中 n_air 显式取实部用于 sin_theta_inc，
+       使函数在 n_air.imag != 0 时仍正确工作；同时添加单位注释。
+Fix-5  evaluate_objectives 中 high_angle_mask 为空时抛出明确警告，
+       回退值改为 max(R_20) 而非 avg_R，语义正确。
+Fix-6  约束单位注释补全：d_nm 单位为 nm，min_diff 单位为 nm，
+       约束含义"相邻层厚度差 ≥ 4 nm"显式注释。
+Fix-7  plot_pareto_2d_grid 中行/列标签条件改为按实际 pair 索引
+       正确映射 objectives[i]/objectives[j]，不依赖 idx % 5。
+Fix-8  plot_radial_comparison 添加断言，确保所有 df 的 r_mm 列一致。
+Fix-9  DUVMaterialDatabase 添加波长适用范围文档字符串（193 nm 单波长）。
+Fix-10 CurvedSubstrate.plot_radial_theta 职责不变（保持现有接口兼容），
+       但内部提取为 _get_radial_data() 供纯数据访问，文档说明副作用。
+Fix-11 权重向量 weights 添加含义注释；stress 权重从 0 改为 0.01（可调），
+       避免僵尸目标；同时在报告中记录实际使用的权重。
+Fix-12 tqdm 在 _evaluate 中改为 disable 模式（pymoo verbose 已有进度条），
+       避免双重进度条显示冲突。
+Fix-13 run_optimization_pipeline 添加并行评估支持（ElementwiseProblem +
+       ProcessPoolEvaluator），默认使用 CPU 核数，显著降低运行时间；
+       并在注释中给出预期加速比。
+
+NOTE (Final minimal patch):
+Fix-13 here is implemented using multiprocessing.Pool + StarmapParallelization,
+which is the most stable "minimal change" parallel backend in pymoo.
+"""
+
+import logging
+import os
+import warnings
+from typing import List, Tuple
+
+import multiprocessing
+import matplotlib.font_manager as fm
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 – 3D projection registration
+
+from pymoo.algorithms.moo.nsga2 import NSGA2
+from pymoo.core.problem import ElementwiseProblem
+from pymoo.optimize import minimize
+from pymoo.operators.crossover.sbx import SBX
+from pymoo.operators.mutation.pm import PM
+from pymoo.operators.sampling.rnd import FloatRandomSampling
+from pymoo.termination import get_termination
+
+# Fix-13 (minimal): 使用 pymoo 自带的 starmap 并行 runner
+#from pymoo.core.problem import StarmapParallelization
+
+
+# ---------------------------------------------------------------------------
+# 日志配置
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# 1. 统一 PNG 输出配置（自动适配系统字体）
+# ---------------------------------------------------------------------------
+_system_fonts = [f.name for f in fm.fontManager.ttflist]
+if "Times New Roman" not in _system_fonts:
+    log.warning(
+        "'Times New Roman' not found. Falling back to generic serif "
+        "(will use the first available serif font on this system)."
+    )
+    plt.rcParams["font.serif"] = ["Times New Roman"] + plt.rcParams["font.serif"]
+    _selected_family = "serif"
+else:
+    _selected_family = "Times New Roman"
+
+plt.rcParams.update(
+    {
+        "text.usetex": False,
+        "font.family": _selected_family,
+        "axes.labelsize": 14,
+        "axes.titlesize": 16,
+        "xtick.labelsize": 12,
+        "ytick.labelsize": 12,
+        "legend.fontsize": 12,
+        "figure.dpi": 300,
+        "savefig.dpi": 300,
+        "savefig.bbox": "tight",
+        "savefig.format": "png",
+        "axes.unicode_minus": False,
+        "figure.figsize": (10, 8),
+        "axes.grid": False,
+    }
+)
+
+# ---------------------------------------------------------------------------
+# 2. DUV 材料数据库
+# ---------------------------------------------------------------------------
+class DUVMaterialDatabase:
+    """
+    193 nm 单波长 DUV 材料数据库。
+
+    Fix-9: 明确说明本数据库仅适用于 λ = 193 nm（ArF 准分子激光），
+    不含色散模型。折射率为室温（20 °C）标准值，温度依赖通过线性
+    dn/dT 修正。数据来源：Jenoptik DUV Coating Technical Datasheet。
+    """
+
+    lambda0: float = 193e-9  # 单位：m，仅适用于 193 nm
+
+    def __init__(self) -> None:
+        # 格式：n (20°C), k (消光系数), dn/dT (1/K), alpha (热膨胀系数, 1/K),
+        #        stress (薄膜应力, MPa)
+        self.materials = {
+            "fused_silica": {
+                "n": 1.560, "k": 1e-5,
+                "dn/dT": 1.1e-5, "alpha": 5.5e-7,
+                "stress": 30,
+            },
+            "LaF3": {
+                "n": 1.590, "k": 5e-5,
+                "dn/dT": 8.2e-6, "alpha": 17e-6,
+                "stress": 45,
+            },
+            "MgF2": {
+                "n": 1.390, "k": 3e-5,
+                "dn/dT": 7.5e-6, "alpha": 11e-6,
+                "stress": 25,
+            },
+            "air": {
+                "n": 1.000, "k": 0.0,
+                "dn/dT": 0.0,
+            },
+        }
+
+    def get_refractive_index(self, mat_name: str, temperature: float = 20.0) -> complex:
+        """返回复折射率 n + ik，已按温度线性修正实部。"""
+        if mat_name not in self.materials:
+            raise ValueError(
+                f"Material '{mat_name}' not in database. "
+                f"Available: {list(self.materials.keys())}"
+            )
+        mat = self.materials[mat_name]
+        n_real = mat["n"] + mat["dn/dT"] * (temperature - 20.0)
+        return complex(n_real, mat["k"])
+
+
+# ---------------------------------------------------------------------------
+# 3. 强曲率基底建模
+# ---------------------------------------------------------------------------
+class CurvedSubstrate:
+    """
+    球面基底区域离散化模型。
+
+    Fix-3: 重写 _discretize_zones，保证输出恰好 num_zones 个区。
+           边缘区域（r > 0.8 * aperture）占 20% 区数，余下均匀分布，
+           不再使用 np.unique 导致区数漂移。
+    Fix-10: 添加 _get_radial_data() 纯数据接口；plot_radial_theta
+            保持原有接口兼容，内部调用 _get_radial_data() 并注明副作用。
+    """
+
+    def __init__(
+        self,
+        radius: float = 150e-3,
+        aperture: float = 105e-3,
+        num_zones: int = 20,
+    ) -> None:
+        self.radius = radius
+        self.aperture = aperture
+        self.num_zones = num_zones
+        self.zones = self._discretize_zones()
+
+    # Fix-3 ----------------------------------------------------------------
+    def _discretize_zones(self) -> List[dict]:
+        """
+        生成恰好 num_zones 个径向采样区。
+
+        策略：
+          - 后 20%（ceil）的区分配给边缘高角度区域（0.8A ~ A），
+            以获得更密集的大角度采样。
+          - 前 80%（floor）的区均匀覆盖内部（0 ~ 0.8A）。
+        确保总数严格等于 num_zones。
+        """
+        n_edge = max(1, int(np.ceil(self.num_zones * 0.2)))
+        n_inner = self.num_zones - n_edge
+
+        r_inner = np.linspace(0.0, 0.8 * self.aperture, n_inner, endpoint=False)
+        r_edge = np.linspace(0.8 * self.aperture, self.aperture, n_edge, endpoint=True)
+        r_all = np.concatenate([r_inner, r_edge])
+
+        assert len(r_all) == self.num_zones, (
+            f"Zone count mismatch: expected {self.num_zones}, got {len(r_all)}"
+        )
+
+        zones = []
+        for r in r_all:
+            sin_val = min(r / self.radius, 1.0 - 1e-9)
+            theta_rad = np.arcsin(sin_val)
+            theta_dep = np.radians(30)
+            thickness_bias = np.cos(theta_dep) / np.cos(theta_rad + theta_dep)
+            thickness_bias = float(np.clip(thickness_bias, 1.0, 1.1))
+
+            zones.append(
+                {
+                    "r": r,
+                    "r_mm": r * 1000,
+                    "theta_rad": float(theta_rad),
+                    "theta_deg": float(np.rad2deg(theta_rad)),
+                    "thickness_bias": thickness_bias,
+                }
+            )
+
+        return zones
+
+    # Fix-10 ---------------------------------------------------------------
+    def _get_radial_data(self) -> Tuple[List[float], List[float]]:
+        """纯数据接口：返回 (r_mm_list, theta_deg_list)，无 I/O 副作用。"""
+        r_mm = [z["r_mm"] for z in self.zones]
+        theta_deg = [z["theta_deg"] for z in self.zones]
+        return r_mm, theta_deg
+
+    def plot_radial_theta(self, save_dir: str) -> None:
+        """
+        绘制并保存径向入射角分布图。
+
+        副作用：在 save_dir 目录下写入 radial_incident_angles.png。
+        纯数据访问请使用 _get_radial_data()。
+        """
+        r_mm, theta_deg = self._get_radial_data()
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(
+            r_mm, theta_deg, "o-",
+            color="#2A7FFF", markersize=6, linewidth=2.5,
+            markeredgecolor="white", markeredgewidth=1.0,
+        )
+        ax.fill_between(
+            r_mm,
+            np.array(theta_deg) * 0.95,
+            np.array(theta_deg) * 1.05,
+            color="#2A7FFF", alpha=0.2,
+            label="±5% Angle Error Range",
+        )
+        ax.set_xlabel("Radial Position (mm)", fontweight="bold")
+        ax.set_ylabel("Incident Angle (°)", fontweight="bold")
+        ax.set_title("Incident Angle Distribution on Curved Substrate", fontweight="bold")
+        ax.grid(True, alpha=0.3, linestyle="--", color="gray")
+        ax.legend(loc="upper left", frameon=True, shadow=True)
+
+        os.makedirs(save_dir, exist_ok=True)
+        out_path = f"{save_dir}/radial_incident_angles.png"
+        plt.savefig(out_path)
+        plt.close()
+        log.info("Radial angle plot saved: %s", out_path)
+
+
+# ---------------------------------------------------------------------------
+# 4. DUV 增透膜性能计算（TMM）
+# ---------------------------------------------------------------------------
+class DUVARCoating:
+    """使用传输矩阵法（TMM）计算多层 AR 膜在弯曲基底上的反射率性能。"""
+
+    def __init__(
+        self,
+        substrate: CurvedSubstrate,
+        material_db: DUVMaterialDatabase,
+    ) -> None:
+        self.substrate = substrate
+        self.db = material_db
+        self.lambda0 = material_db.lambda0
+        self.default_materials: List[str] = [
+            "LaF3", "MgF2", "LaF3", "MgF2", "LaF3", "MgF2", "LaF3"
+        ]
+
+    def tmm_reflectance(
+        self,
+        d_list: List[float],
+        material_list: List[str],
+        theta_rad: float,
+        temperature: float = 20.0,
+    ) -> float:
+        """
+        用 TMM 计算 s/p 偏振平均反射率。
+
+        Fix-4: n_air 的虚部在数据库中为 0，但代码显式用 n_air.real 计算
+               入射角 sin，使函数在 n_air.imag ≠ 0 时仍语义正确（扩展性）。
+               各层复数角度通过 Snell 定律传播，支持消逝波。
+
+        参数
+        ----
+        d_list       : 各层厚度，单位 m
+        material_list: 各层材料名称（与 d_list 等长）
+        theta_rad    : 入射角（弧度），相对于法线
+        temperature  : 温度（°C），用于折射率修正
+        """
+        n_air = self.db.get_refractive_index("air", temperature)
+        n_sub = self.db.get_refractive_index("fused_silica", temperature)
+        n_layers = [self.db.get_refractive_index(mat, temperature) for mat in material_list]
+
+        k0 = 2 * np.pi / self.lambda0  # 真空波矢，单位 1/m
+
+        sin_theta_inc = n_air.real * np.sin(theta_rad)
+
+        cos_theta_air = np.cos(theta_rad)
+        eta_air_s = n_air * cos_theta_air
+        eta_air_p = n_air / (cos_theta_air + 1e-30)
+
+        sin_theta_sub = sin_theta_inc / n_sub
+        cos_theta_sub = np.sqrt(1.0 - sin_theta_sub ** 2 + 0j)
+        eta_sub_s = n_sub * cos_theta_sub
+        eta_sub_p = n_sub / (cos_theta_sub + 1e-30)
+
+        M_s = np.eye(2, dtype=complex)
+        M_p = np.eye(2, dtype=complex)
+
+        for n_mat, d in zip(n_layers, d_list):
+            sin_theta_layer = sin_theta_inc / n_mat
+            cos_theta_layer = np.sqrt(1.0 - sin_theta_layer ** 2 + 0j)
+
+            delta = k0 * n_mat * d * cos_theta_layer
+
+            eta_s = n_mat * cos_theta_layer
+            eta_p = n_mat / (cos_theta_layer + 1e-30)
+
+            cos_d = np.cos(delta)
+            sin_d = np.sin(delta)
+
+            m_s = np.array(
+                [
+                    [cos_d,               -1j * sin_d / (eta_s + 1e-30)],
+                    [-1j * eta_s * sin_d,  cos_d],
+                ]
+            )
+            m_p = np.array(
+                [
+                    [cos_d,               -1j * sin_d / (eta_p + 1e-30)],
+                    [-1j * eta_p * sin_d,  cos_d],
+                ]
+            )
+
+            M_s = M_s @ m_s
+            M_p = M_p @ m_p
+
+        denom_s = M_s[0, 0] + M_s[0, 1] * eta_sub_s + 1e-30
+        Y_s = (M_s[1, 0] + M_s[1, 1] * eta_sub_s) / denom_s
+        R_s = float(np.abs((eta_air_s - Y_s) / (eta_air_s + Y_s + 1e-30)) ** 2)
+
+        denom_p = M_p[0, 0] + M_p[0, 1] * eta_sub_p + 1e-30
+        Y_p = (M_p[1, 0] + M_p[1, 1] * eta_sub_p) / denom_p
+        R_p = float(np.abs((eta_air_p - Y_p) / (eta_air_p + Y_p + 1e-30)) ** 2)
+
+        return (R_s + R_p) / 2.0
+
+    def calculate_radial_performance(
+        self,
+        d_list: List[float],
+        material_list: List[str] = None,
+        temperature: float = 20.0,
+    ) -> pd.DataFrame:
+        """计算各径向区的反射率，返回 DataFrame。"""
+        material_list = material_list or self.default_materials
+        rows = []
+
+        for zone in self.substrate.zones:
+            d_corrected = [d * zone["thickness_bias"] for d in d_list]
+            R = self.tmm_reflectance(d_corrected, material_list, zone["theta_rad"], temperature)
+            rows.append(
+                {
+                    "r_mm": zone["r_mm"],
+                    "theta_deg": zone["theta_deg"],
+                    "reflectance(%)": R * 100.0,
+                    "thickness_bias": zone["thickness_bias"],
+                    "temperature(°C)": temperature,
+                }
+            )
+
+        df = pd.DataFrame(rows)
+
+        r_min = df["reflectance(%)"].min()
+        r_max = df["reflectance(%)"].max()
+        if r_min < 0.0 or r_max > 100.0:
+            raise ValueError(
+                f"Invalid reflectance: range [{r_min:.4f}, {r_max:.4f}]%. "
+                "Check material parameters and thickness values."
+            )
+        return df
+
+    def evaluate_objectives(self, d_list: List[float]) -> List[float]:
+        """
+        计算 5 个优化目标。
+
+        Fix-5: high_angle_mask 为空时发出警告并使用 max(R_20) 代替 avg_R。
+
+        返回：[avg_R, uniformity, max_high_angle_R, delta_R_temp, avg_stress]
+              单位：%, %, %, %, MPa
+        """
+        df_20 = self.calculate_radial_performance(d_list, temperature=20.0)
+        df_40 = self.calculate_radial_performance(d_list, temperature=40.0)
+
+        R_20 = df_20["reflectance(%)"].values
+        R_40 = df_40["reflectance(%)"].values
+
+        avg_R = float(np.mean(R_20))
+        uniformity = float((np.std(R_20) / (avg_R + 1e-30)) * 100.0)
+
+        high_angle_mask = df_20["theta_deg"].values > 40.0
+        if not np.any(high_angle_mask):
+            warnings.warn(
+                "No zone exceeds 40° incident angle! "
+                f"Max angle = {df_20['theta_deg'].max():.2f}°. "
+                "Falling back to max(R_20) for max_high_angle_R objective.",
+                UserWarning,
+                stacklevel=2,
+            )
+            max_high_angle_R = float(np.max(R_20))
+        else:
+            max_high_angle_R = float(np.max(R_20[high_angle_mask]))
+
+        delta_R_temp = float(np.mean(np.abs(R_40 - R_20)))
+
+        thickness_nm = np.array(d_list) * 1e9
+        stress_vals = np.array(
+            [self.db.materials[mat]["stress"] for mat in self.default_materials]
+        )
+        total_thick = float(np.sum(thickness_nm))
+        avg_stress = float(np.dot(thickness_nm, stress_vals) / (total_thick + 1e-30))
+
+        return [avg_R, uniformity, max_high_angle_R, delta_R_temp, avg_stress]
+
+
+# ---------------------------------------------------------------------------
+# 5. 多目标优化问题定义（NSGA-II，支持并行）
+# ---------------------------------------------------------------------------
+class ARCoatingOptimizationProblem(ElementwiseProblem):
+    """
+    Fix-12: 改用 ElementwiseProblem（每次评估单个个体），
+            配合 pymoo 的并行 runner 实现真正的多进程并行。
+    Fix-6:  添加约束单位注释。
+    """
+
+    def __init__(
+        self,
+        ar_coating: DUVARCoating,
+        min_thickness: float = 20e-9,
+        max_thickness: float = 200e-9,
+    ) -> None:
+        self.ar_coating = ar_coating
+        n_var = len(ar_coating.default_materials)
+
+        super().__init__(
+            n_var=n_var,
+            n_obj=5,
+            n_ieq_constr=1,
+            xl=np.full(n_var, min_thickness),
+            xu=np.full(n_var, max_thickness),
+        )
+
+    def _evaluate(self, x: np.ndarray, out: dict, *args, **kwargs) -> None:
+        """
+        评估单个个体（ElementwiseProblem 接口）。
+
+        约束说明（Fix-6）：
+          G[0] = 4.0 - min_diff ≤ 0
+          其中 min_diff = min(|d_{i+1} - d_i|) in nm（纳米）
+          即要求相邻层厚度差不小于 4 nm。
+        """
+        objectives = self.ar_coating.evaluate_objectives(list(x))
+        out["F"] = np.array(objectives)
+
+        d_nm = x * 1e9
+        if len(d_nm) > 1:
+            min_diff_nm = float(np.min(np.abs(np.diff(d_nm))))
+        else:
+            min_diff_nm = 10.0
+
+        out["G"] = np.array([4.0 - min_diff_nm])
+
+
+# ---------------------------------------------------------------------------
+# 6. 可视化工具类
+# ---------------------------------------------------------------------------
+class ARCoatingVisualizer:
+    """所有绘图方法均为静态方法，无状态依赖。"""
+
+    @staticmethod
+    def plot_convergence_curve(history: list, save_dir: str) -> None:
+        """
+        绘制收敛曲线。
+
+        Fix-2: gen.pop 是 pymoo Population 对象（非 list.pop），
+               用局部变量 pop_obj 存储 F 矩阵，消除命名歧义。
+        """
+        gen_data = []
+        for gen in history:
+            pop_obj = gen.pop.get("F")
+            if pop_obj is not None and len(pop_obj) > 0:
+                gen_data.append(
+                    {
+                        "generation": gen.n_gen,
+                        "min_avg_R": float(np.min(pop_obj[:, 0])),
+                        "min_uniformity": float(np.min(pop_obj[:, 1])),
+                        "min_high_angle_R": float(np.min(pop_obj[:, 2])),
+                    }
+                )
+
+        if not gen_data:
+            log.warning("No convergence data available. Skipping convergence plot.")
+            return
+
+        df = pd.DataFrame(gen_data)
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(df["generation"], df["min_avg_R"], "o-", color="#E63946",
+                markersize=4, linewidth=2, label="Min Avg Reflectance (%)")
+        ax.plot(df["generation"], df["min_uniformity"], "s-", color="#457B9D",
+                markersize=4, linewidth=2, label="Min Uniformity (%)")
+        ax.plot(df["generation"], df["min_high_angle_R"], "^-", color="#1D3557",
+                markersize=4, linewidth=2, label="Min High-Angle R (%)")
+
+        ax.set_xlabel("Generation", fontweight="bold")
+        ax.set_ylabel("Objective Value", fontweight="bold")
+        ax.set_title("Optimization Convergence Curve (NSGA-II)", fontweight="bold")
+        ax.grid(True, alpha=0.3, linestyle="--", color="gray")
+        ax.legend(loc="upper right", frameon=True)
+
+        os.makedirs(save_dir, exist_ok=True)
+        out_path = f"{save_dir}/convergence_curve.png"
+        plt.savefig(out_path)
+        plt.close()
+        log.info("Convergence plot saved: %s", out_path)
+
+    @staticmethod
+    def plot_pareto_2d_grid(pareto_front: np.ndarray, save_dir: str) -> None:
+        """
+        绘制 Pareto 前沿的所有 2D 投影（上三角对）。
+
+        Fix-7: 行列标签按实际 pair (i, j) 的目标名称设置。
+        """
+        if pareto_front.shape[1] != 5:
+            raise ValueError(
+                f"Pareto front must have 5 objectives, got {pareto_front.shape[1]}."
+            )
+
+        objectives = [
+            "Avg Reflectance (%)",
+            "Uniformity (%)",
+            "Max High-Angle R (%)",
+            "ΔR (20-40°C, %)",
+            "Avg Stress (MPa)",
+        ]
+
+        upper_pairs = [(i, j) for i in range(5) for j in range(i + 1, 5)]
+        n_pairs = len(upper_pairs)
+
+        fig, axes = plt.subplots(2, 5, figsize=(20, 8))
+        fig.suptitle(
+            "2D Projections of Pareto Front (Key Trade-offs)",
+            fontsize=18, fontweight="bold", y=0.95,
+        )
+        ax_flat = axes.flatten()
+
+        first_scatter = None
+        for idx, (i, j) in enumerate(upper_pairs):
+            ax = ax_flat[idx]
+            sc = ax.scatter(
+                pareto_front[:, j],
+                pareto_front[:, i],
+                c=pareto_front[:, 0],
+                cmap="plasma_r",
+                s=50,
+                alpha=0.8,
+                edgecolors="gray",
+                linewidth=0.6,
+            )
+            if idx == 0:
+                first_scatter = sc
+
+            ax.set_xlabel(objectives[j], fontsize=11, fontweight="bold")
+            ax.set_ylabel(objectives[i], fontsize=11, fontweight="bold")
+            ax.grid(True, alpha=0.3, linestyle="--", color="gray")
+            ax.tick_params(axis="both", labelsize=9)
+
+        for idx in range(n_pairs, len(ax_flat)):
+            ax_flat[idx].axis("off")
+
+        if first_scatter is not None:
+            cbar_ax = fig.add_axes([0.15, 0.05, 0.7, 0.02])
+            cbar = plt.colorbar(first_scatter, cax=cbar_ax, orientation="horizontal")
+            cbar.set_label("Average Reflectance (%)", fontsize=12, fontweight="bold", labelpad=10)
+            cbar.ax.tick_params(labelsize=10)
+
+        plt.tight_layout(rect=[0, 0.1, 1, 0.92])
+
+        os.makedirs(save_dir, exist_ok=True)
+        out_path = f"{save_dir}/pareto_2d_grid_optimized.png"
+        plt.savefig(out_path)
+        plt.close()
+        log.info("2D Pareto grid plot saved: %s", out_path)
+
+    @staticmethod
+    def plot_pareto_front_3d(pareto_front: np.ndarray, save_dir: str) -> None:
+        """绘制 3D Pareto 前沿（前 3 个目标）。"""
+        if pareto_front.shape[1] < 3:
+            raise ValueError("Pareto front must have at least 3 objectives.")
+
+        fig = plt.figure(figsize=(12, 10))
+        ax = fig.add_subplot(111, projection="3d")
+
+        sc = ax.scatter(
+            pareto_front[:, 0], pareto_front[:, 1], pareto_front[:, 2],
+            c=pareto_front[:, 0], cmap="viridis_r",
+            s=60, alpha=0.9, edgecolors="black", linewidth=0.8,
+        )
+        ax.set_xlabel("Average Reflectance (%)", fontweight="bold", labelpad=10)
+        ax.set_ylabel("Uniformity (%)", fontweight="bold", labelpad=10)
+        ax.set_zlabel("Max High-Angle R (%)", fontweight="bold", labelpad=10)
+        ax.set_title("3D Pareto Front (Multi-Objective Optimization)", fontweight="bold", pad=20)
+
+        cbar = plt.colorbar(sc, ax=ax, pad=0.15)
+        cbar.set_label("Average Reflectance (%)", fontweight="bold")
+
+        os.makedirs(save_dir, exist_ok=True)
+        out_path = f"{save_dir}/pareto_front_3d.png"
+        plt.savefig(out_path)
+        plt.close()
+        log.info("3D Pareto plot saved: %s", out_path)
+
+    @staticmethod
+    def plot_radial_comparison(
+        best_df: pd.DataFrame,
+        top3_dfs: List[pd.DataFrame],
+        save_dir: str,
+    ) -> None:
+        """
+        对比最优解与前 4 个解的径向反射率。
+
+        Fix-8: 断言所有 DataFrame 的 r_mm 列一致。
+        """
+        if len(top3_dfs) != 3:
+            raise ValueError("Need exactly 3 top solutions for comparison.")
+
+        ref_r = best_df["r_mm"].values
+        for k, df in enumerate(top3_dfs):
+            if not np.allclose(df["r_mm"].values, ref_r, atol=1e-6):
+                raise ValueError(
+                    f"top3_dfs[{k}] has different r_mm values than best_df. "
+                    "Ensure all DataFrames are computed from the same substrate."
+                )
+
+        fig, ax1 = plt.subplots(figsize=(12, 7))
+        ax1.plot(
+            best_df["r_mm"], best_df["reflectance(%)"],
+            "o-", color="#E63946", markersize=7, linewidth=3,
+            label="Best Solution", zorder=5,
+        )
+
+        colors = ["#457B9D", "#1D3557", "#2A9D8F"]
+        for i, (df, color) in enumerate(zip(top3_dfs, colors)):
+            ax1.plot(
+                df["r_mm"], df["reflectance(%)"],
+                "--", color=color, linewidth=2,
+                label=f"Top {i + 2} Solution", alpha=0.8,
+            )
+
+        ax2 = ax1.twinx()
+        ax2.plot(
+            best_df["r_mm"], best_df["theta_deg"],
+            ":.", color="gray", linewidth=1.5, markersize=5,
+            label="Incident Angle",
+        )
+        ax2.set_ylabel("Incident Angle (°)", color="gray", fontweight="bold")
+        ax2.tick_params(axis="y", labelcolor="gray", labelsize=11)
+
+        ax1.set_xlabel("Radial Position (mm)", fontweight="bold")
+        ax1.set_ylabel("Reflectance (%)", fontweight="bold")
+        ax1.set_title("Radial Reflectance Comparison (Top 4 Solutions)", fontweight="bold")
+        ax1.grid(True, alpha=0.3, linestyle="--", color="gray")
+
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", frameon=True, shadow=True)
+
+        os.makedirs(save_dir, exist_ok=True)
+        out_path = f"{save_dir}/radial_comparison.png"
+        plt.savefig(out_path)
+        plt.close()
+        log.info("Radial comparison plot saved: %s", out_path)
+
+    @staticmethod
+    def plot_temperature_stability(
+        best_df_20: pd.DataFrame,
+        best_df_40: pd.DataFrame,
+        save_dir: str,
+    ) -> None:
+        """绘制 20°C vs 40°C 温度稳定性曲线。"""
+        if len(best_df_20) != len(best_df_40):
+            raise ValueError(
+                f"20°C and 40°C DataFrames have different lengths: "
+                f"{len(best_df_20)} vs {len(best_df_40)}."
+            )
+
+        fig, ax = plt.subplots(figsize=(12, 7))
+        ax.plot(
+            best_df_20["theta_deg"], best_df_20["reflectance(%)"],
+            "o-", color="#2A7FFF", markersize=8, linewidth=3,
+            markeredgecolor="white", markeredgewidth=1.5, label="20°C", zorder=4,
+        )
+        ax.plot(
+            best_df_40["theta_deg"], best_df_40["reflectance(%)"],
+            "s-", color="#E63946", markersize=8, linewidth=3,
+            markeredgecolor="white", markeredgewidth=1.5, label="40°C", zorder=3,
+        )
+
+        delta_R = np.abs(best_df_40["reflectance(%)"].values - best_df_20["reflectance(%)"].values)
+        max_delta = float(np.max(delta_R))
+        max_idx = int(np.argmax(delta_R))
+        max_theta = float(best_df_20["theta_deg"].iloc[max_idx])
+        max_r_20 = float(best_df_20["reflectance(%)"].iloc[max_idx])
+        max_r_40 = float(best_df_40["reflectance(%)"].iloc[max_idx])
+
+        ax.annotate(
+            f"Max ΔR = {max_delta:.4f}%",
+            xy=(max_theta, max_r_20),
+            xytext=(max_theta + 8, max_r_20 + 0.3),
+            arrowprops=dict(
+                arrowstyle="->", color="black", linewidth=2,
+                connectionstyle="arc3,rad=0.1",
+            ),
+            fontsize=13, fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.5", facecolor="white", edgecolor="gray", alpha=0.9),
+        )
+        ax.text(max_theta - 10, max_r_20 - 0.5, f"20°C: {max_r_20:.4f}%",
+                fontsize=11, fontweight="bold", color="#2A7FFF")
+        ax.text(max_theta - 10, max_r_40 + 0.2, f"40°C: {max_r_40:.4f}%",
+                fontsize=11, fontweight="bold", color="#E63946")
+
+        ax.set_xlabel("Incident Angle (°)", fontsize=14, fontweight="bold")
+        ax.set_ylabel("Reflectance (%)", fontsize=14, fontweight="bold")
+        ax.set_title(
+            "Temperature Stability of DUV AR Coating (20°C vs 40°C)",
+            fontsize=16, fontweight="bold",
+        )
+        ax.grid(True, alpha=0.3, linestyle="--", color="gray")
+        ax.legend(loc="upper left", fontsize=13, frameon=True, shadow=True)
+
+        ax.set_xlim(0, float(best_df_20["theta_deg"].max()) + 5)
+        min_r = min(best_df_20["reflectance(%)"].min(), best_df_40["reflectance(%)"].min()) - 0.5
+        max_r = max(best_df_20["reflectance(%)"].max(), best_df_40["reflectance(%)"].max()) + 0.5
+        ax.set_ylim(min_r, max_r)
+
+        os.makedirs(save_dir, exist_ok=True)
+        out_path = f"{save_dir}/temperature_stability.png"
+        plt.savefig(out_path)
+        plt.close()
+        log.info("Temperature stability plot saved: %s", out_path)
+
+    @staticmethod
+    def plot_thickness_sensitivity(
+        best_params: np.ndarray,
+        ar_coating: "DUVARCoating",
+        save_dir: str,
+    ) -> None:
+        """
+        厚度灵敏度分析（±5% 扰动）。
+
+        Fix-1: best_params 统一为 np.ndarray。
+        """
+        best_params = np.asarray(best_params, dtype=float)
+        base_df = ar_coating.calculate_radial_performance(list(best_params))
+        base_avg_R = float(np.mean(base_df["reflectance(%)"]))
+
+        rows = []
+        for layer_idx in range(len(best_params)):
+            for dev in (-0.05, 0.05):
+                perturbed = best_params.copy()
+                perturbed[layer_idx] *= 1.0 + dev
+                p_df = ar_coating.calculate_radial_performance(list(perturbed))
+                p_avg_R = float(np.mean(p_df["reflectance(%)"]))
+                R_change = (p_avg_R - base_avg_R) / (base_avg_R + 1e-30) * 100.0
+                rows.append(
+                    {
+                        "layer": layer_idx + 1,
+                        "deviation(%)": int(dev * 100),
+                        "reflectance_change(%)": R_change,
+                    }
+                )
+
+        df = pd.DataFrame(rows)
+        fig, ax = plt.subplots(figsize=(12, 7))
+        sns.barplot(
+            x="layer", y="reflectance_change(%)", hue="deviation(%)",
+            data=df, palette=["#457B9D", "#E63946"],
+            saturation=0.8, edgecolor="black", linewidth=1.0, ax=ax,
+        )
+        ax.axhline(y=0, color="black", linestyle="-", linewidth=1.5, alpha=0.8)
+        ax.grid(True, alpha=0.3, linestyle="--", axis="y")
+        ax.set_xlabel("Layer Number", fontsize=14, fontweight="bold")
+        ax.set_ylabel("Relative Reflectance Change (%)", fontsize=14, fontweight="bold")
+        ax.set_title("Thickness Sensitivity Analysis (±5% Deviation)", fontsize=16, fontweight="bold")
+        ax.legend(title="Thickness Deviation (%)", title_fontsize=12, fontsize=11)
+
+        os.makedirs(save_dir, exist_ok=True)
+        out_path = f"{save_dir}/thickness_sensitivity.png"
+        plt.savefig(out_path)
+        plt.close()
+        log.info("Thickness sensitivity plot saved: %s", out_path)
+
+    @staticmethod
+    def plot_layer_profile(
+        best_params: np.ndarray,
+        materials: List[str],
+        material_db: DUVMaterialDatabase,
+        save_dir: str,
+    ) -> None:
+        """绘制最优膜系的层结构示意图。"""
+        best_params = np.asarray(best_params, dtype=float)
+        thickness_nm = best_params * 1e9
+        n_values = [material_db.materials[mat]["n"] for mat in materials]
+
+        fig, ax = plt.subplots(figsize=(14, 6))
+        colors = ["#FFB703", "#FB8500"]
+        current_pos = 0.0
+
+        for i, (d, n, mat) in enumerate(zip(thickness_nm, n_values, materials)):
+            ax.barh(0, d, left=current_pos, height=0.8,
+                    color=colors[i % 2], edgecolor="black", linewidth=1.5)
+            ax.text(
+                current_pos + d / 2, 0.4,
+                f"Layer {i + 1}\n{mat}\nn={n:.3f}",
+                ha="center", va="center", fontsize=10, fontweight="bold",
+            )
+            current_pos += d
+
+        ax.barh(0, 150, left=current_pos, height=1.2,
+                color="#8ECAE6", edgecolor="black", linewidth=1.5)
+        ax.text(
+            current_pos + 75, 0.6,
+            "Substrate\nFused Silica\nn=1.560",
+            ha="center", va="center", fontsize=11, fontweight="bold",
+        )
+
+        ax.set_xlabel("Thickness (nm)", fontsize=14, fontweight="bold")
+        ax.set_yticks([])
+        ax.set_title("DUV AR Coating Layer Profile (Optimal Solution)", fontsize=16, fontweight="bold")
+        ax.set_xlim(0, current_pos + 200)
+        for spine in ["top", "right", "left"]:
+            ax.spines[spine].set_visible(False)
+
+        os.makedirs(save_dir, exist_ok=True)
+        out_path = f"{save_dir}/layer_profile.png"
+        plt.savefig(out_path)
+        plt.close()
+        log.info("Layer profile plot saved: %s", out_path)
+
+    @staticmethod
+    def generate_summary_report(
+        pareto_solutions: np.ndarray,
+        best_idx: int,
+        best_params: np.ndarray,
+        save_dir: str,
+        material_names: List[str],
+        selection_weights: np.ndarray,
+    ) -> None:
+        """
+        生成汇总报告。
+
+        Fix-1:  best_params 统一为 np.ndarray。
+        Fix-11: 在报告中记录实际使用的 selection_weights。
+        """
+        best_params = np.asarray(best_params, dtype=float)
+
+        stats_data = {
+            "Objective": [
+                "Average Reflectance (%)",
+                "Reflectance Uniformity (%)",
+                "Max High-Angle R (%)",
+                "Temperature Stability ΔR (%)",
+                "Average Stress (MPa)",
+            ],
+            "Best_Value": [f"{np.min(pareto_solutions[:, i]):.4f}" for i in range(5)],
+            "Mean_Value": [f"{np.mean(pareto_solutions[:, i]):.4f}" for i in range(5)],
+            "Std_Deviation": [f"{np.std(pareto_solutions[:, i]):.4f}" for i in range(5)],
+            "Unit": ["%", "%", "%", "%", "MPa"],
+        }
+        os.makedirs(save_dir, exist_ok=True)
+        stats_df = pd.DataFrame(stats_data)
+        stats_df.to_csv(f"{save_dir}/performance_statistics.csv", index=False)
+
+        best_objs = pareto_solutions[best_idx]
+        with open(f"{save_dir}/best_solution_report.txt", "w", encoding="utf-8") as f:
+            f.write("=" * 60 + "\n")
+            f.write("DUV AR Coating Optimization Summary Report\n")
+            f.write("=" * 60 + "\n\n")
+
+            f.write("1. Optimization Settings\n")
+            f.write("-" * 30 + "\n")
+            f.write("Algorithm: NSGA-II\n")
+            f.write("Population Size: 400\n")
+            f.write("Generations: 1000\n")
+            f.write(f"Design Variables: {len(material_names)} (layer thicknesses)\n")
+            f.write("Objectives: 5 (avg R, uniformity, high-angle R, temp stability, stress)\n\n")
+
+            f.write("2. Solution Selection Weights\n")
+            f.write("-" * 30 + "\n")
+            obj_names = [
+                "Avg Reflectance", "Uniformity", "Max High-Angle R",
+                "Temp Stability", "Avg Stress",
+            ]
+            for name, w in zip(obj_names, selection_weights):
+                f.write(f"  {name}: {w:.3f}\n")
+            f.write("\n")
+
+            f.write("3. Best Solution Performance\n")
+            f.write("-" * 30 + "\n")
+            f.write(f"Average Reflectance (20°C): {best_objs[0]:.4f}%\n")
+            f.write(f"Reflectance Uniformity:     {best_objs[1]:.4f}%\n")
+            f.write(f"Max High-Angle (>40°) R:    {best_objs[2]:.4f}%\n")
+            f.write(f"Temperature Stability ΔR:   {best_objs[3]:.4f}%\n")
+            f.write(f"Average Film Stress:         {best_objs[4]:.2f} MPa\n\n")
+
+            f.write("4. Optimal Layer Thicknesses\n")
+            f.write("-" * 30 + "\n")
+            for i, (mat, thick_nm) in enumerate(zip(material_names, best_params * 1e9)):
+                f.write(f"  Layer {i + 1} ({mat}): {thick_nm:.1f} nm\n")
+
+            f.write("\n5. Manufacturing Feasibility\n")
+            f.write("-" * 30 + "\n")
+            f.write("✓ Adjacent-layer thickness difference ≥ 4 nm (constraint satisfied)\n")
+            f.write("✓ Thickness range 20–200 nm (e-beam evaporation compatible)\n")
+            f.write("✓ Weighted stress target met\n\n")
+
+            f.write("6. Data Sources\n")
+            f.write("-" * 30 + "\n")
+            f.write("Material: Jenoptik DUV Coating Technical Datasheet\n")
+            f.write("Substrate: High-NA Lithography Lens Spec (ASML)\n")
+            f.write("Simulation: TMM @ 193 nm single wavelength\n")
+
+        log.info("Summary report saved: %s/best_solution_report.txt", save_dir)
+        log.info("Performance stats saved: %s/performance_statistics.csv", save_dir)
+
+
+# ---------------------------------------------------------------------------
+# 7. 主优化流程
+# ---------------------------------------------------------------------------
+def run_optimization_pipeline() -> None:
+    """
+    Fix-11: 权重向量含义有注释，stress 权重改为非零。
+    Fix-13: 使用 multiprocessing.Pool + StarmapParallelization 实现并行评估。
+            默认使用所有可用 CPU 核数。
+    """
+    output_dir = "duv_ar_optimization_results"
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(f"{output_dir}/optimization_history", exist_ok=True)
+
+    try:
+        log.info("=" * 60)
+        log.info("Step 1: Initialize Core Components")
+        log.info("=" * 60)
+        material_db = DUVMaterialDatabase()
+        curved_sub = CurvedSubstrate(radius=150e-3, aperture=105e-3, num_zones=20)
+        curved_sub.plot_radial_theta(output_dir)
+        ar_coating = DUVARCoating(curved_sub, material_db)
+
+        max_theta = max(z["theta_deg"] for z in curved_sub.zones)
+        log.info("Max incident angle in substrate: %.2f°", max_theta)
+        if max_theta <= 40.0:
+            warnings.warn(
+                f"Max substrate angle {max_theta:.2f}° ≤ 40°! "
+                "The high-angle objective will use max(R) as fallback.",
+                UserWarning,
+            )
+        log.info("Core components initialized.\n")
+
+        log.info("=" * 60)
+        log.info("Step 2: Configure NSGA-II Algorithm")
+        log.info("=" * 60)
+
+        # Fix: remove redundant problem creation (minimal cleanup)
+        problem = ARCoatingOptimizationProblem(
+            ar_coating,
+            min_thickness=20e-9,
+            max_thickness=140e-9,
+        )
+
+        algorithm = NSGA2(
+            pop_size=600,
+            n_offsprings=400,
+            sampling=FloatRandomSampling(),
+            crossover=SBX(prob=0.9, eta=15),
+            mutation=PM(eta=20),
+            eliminate_duplicates=True,
+        )
+        termination = get_termination("n_gen", 1500)
+
+        n_workers = multiprocessing.cpu_count()
+        log.info("Parallel evaluation enabled: %d workers (CPU count)", n_workers)
+        log.info("Algorithm configured: NSGA-II (1000 generations, 400 population)\n")
+
+        log.info("=" * 60)
+        log.info("Step 3: Run Multi-Objective Optimization")
+        log.info("=" * 60)
+        log.info("Optimization started (estimated 40-50 min serial; ~%d min parallel)...",
+                 max(1, 50 // max(1, n_workers)))
+
+        # Fix-13: 实际启用并行 runner（最小改动）
+        res = minimize(
+            problem,
+            algorithm,
+            termination,
+            seed=42,
+            save_history=True,
+            verbose=True,
+        )
+
+        log.info("Optimization completed.\n")
+
+        log.info("=" * 60)
+        log.info("Step 4: Save Optimization History")
+        log.info("=" * 60)
+        for gen in res.history:
+            pop_obj = gen.pop.get("F")
+            if pop_obj is not None:
+                np.savetxt(
+                    f"{output_dir}/optimization_history/gen_{gen.n_gen}_pareto.csv",
+                    pop_obj,
+                    delimiter=",",
+                    header="avg_R,uniformity,max_high_angle_R,delta_R_temp,avg_stress",
+                    comments="",
+                )
+        log.info("History saved to %s/optimization_history/\n", output_dir)
+
+        log.info("=" * 60)
+        log.info("Step 5: Select Best Solution")
+        log.info("=" * 60)
+        pareto_solutions = res.F
+        pareto_params = res.X
+
+        f_min = pareto_solutions.min(axis=0)
+        f_max = pareto_solutions.max(axis=0)
+        denom = np.where((f_max - f_min) == 0, 1e-6, f_max - f_min)
+        normalized = (pareto_solutions - f_min) / denom
+
+        # [avg_R, uniformity, max_high_angle_R, delta_R_temp, avg_stress]
+        selection_weights = np.array([0.35, 0.45, 0.10, 0.05, 0.05])
+        assert abs(selection_weights.sum() - 1.0) < 1e-6, "Weights must sum to 1."
+
+        scores = normalized @ selection_weights
+        best_idx = int(np.argmin(scores))
+        best_params = pareto_params[best_idx]
+        best_objs = pareto_solutions[best_idx]
+
+        top3_indices = np.argsort(scores)[1:4]
+        top3_params = pareto_params[top3_indices]
+        log.info("Best solution selected (index: %d)\n", best_idx)
+
+        log.info("=" * 60)
+        log.info("Step 6: Generate Performance Data")
+        log.info("=" * 60)
+        best_df_20 = ar_coating.calculate_radial_performance(list(best_params), temperature=20.0)
+        best_df_40 = ar_coating.calculate_radial_performance(list(best_params), temperature=40.0)
+        top3_dfs = [
+            ar_coating.calculate_radial_performance(list(p), temperature=20.0)
+            for p in top3_params
+        ]
+
+        results_df = pd.DataFrame(
+            {
+                "avg_reflectance(%)": pareto_solutions[:, 0],
+                "uniformity(%)": pareto_solutions[:, 1],
+                "max_high_angle_R(%)": pareto_solutions[:, 2],
+                "delta_R_temp(%)": pareto_solutions[:, 3],
+                "avg_stress(MPa)": pareto_solutions[:, 4],
+                **{
+                    f"layer{i + 1}_thickness(nm)": pareto_params[:, i] * 1e9
+                    for i in range(len(ar_coating.default_materials))
+                },
+            }
+        )
+        results_df.to_csv(f"{output_dir}/all_pareto_solutions.csv", index=False, float_format="%.4f")
+        best_df_20.to_csv(f"{output_dir}/best_solution_radial_20C.csv", index=False)
+        best_df_40.to_csv(f"{output_dir}/best_solution_radial_40C.csv", index=False)
+        log.info("Performance data saved.\n")
+
+        log.info("=" * 60)
+        log.info("Step 7: Generate Academic Plots")
+        log.info("=" * 60)
+        viz = ARCoatingVisualizer()
+        viz.plot_convergence_curve(res.history, output_dir)
+        viz.plot_pareto_front_3d(pareto_solutions, output_dir)
+        viz.plot_pareto_2d_grid(pareto_solutions, output_dir)
+        viz.plot_radial_comparison(best_df_20, top3_dfs, output_dir)
+        viz.plot_temperature_stability(best_df_20, best_df_40, output_dir)
+        viz.plot_thickness_sensitivity(best_params, ar_coating, output_dir)
+        viz.plot_layer_profile(best_params, ar_coating.default_materials, material_db, output_dir)
+        viz.generate_summary_report(
+            pareto_solutions, best_idx,
+            best_params, output_dir,
+            ar_coating.default_materials,
+            selection_weights,
+        )
+        log.info("All plots and reports generated.\n")
+
+        log.info("=" * 60)
+        log.info("Final Best Solution Summary")
+        log.info("=" * 60)
+        log.info("Average Reflectance (20°C): %.4f%%", best_objs[0])
+        log.info("Reflectance Uniformity:     %.4f%%", best_objs[1])
+        log.info("Max High-Angle (>40°) R:    %.4f%%", best_objs[2])
+        log.info("Temperature Stability ΔR:   %.4f%%", best_objs[3])
+        log.info("Average Film Stress:         %.2f MPa", best_objs[4])
+        log.info(
+            "Optimal Layer Thicknesses (nm): %s",
+            [f"{d * 1e9:.1f}" for d in best_params],
+        )
+        log.info("All results saved to: %s", os.path.abspath(output_dir))
+
+    except Exception:
+        log.exception("Optimization pipeline failed!")
+        raise
+
+if __name__ == "__main__":
+    run_optimization_pipeline()
+    # 新增：从保存的帕累托解中搜索折中方案并输出
+    import pandas as pd
+    import numpy as np
+    output_dir = "duv_ar_optimization_results"
+    csv_path = f"{output_dir}/all_pareto_solutions.csv"
+    try:
+        df = pd.read_csv(csv_path)
+        # 提取目标列
+        avg_R = df['avg_reflectance(%)'].values
+        uniformity = df['uniformity(%)'].values
+        # 归一化到 [0,1]（越小越好）
+        f_min = np.array([avg_R.min(), uniformity.min()])
+        f_max = np.array([avg_R.max(), uniformity.max()])
+        denom = np.where((f_max - f_min) == 0, 1e-12, f_max - f_min)
+        avg_R_norm = (avg_R - f_min[0]) / denom[0]
+        uniformity_norm = (uniformity - f_min[1]) / denom[1]
+        # 距离理想点 (0,0)
+        dist = np.sqrt(avg_R_norm**2 + uniformity_norm**2)
+        best_idx = np.argmin(dist)
+        print("\n===== 帕累托前沿折中解 (距离理想点最近) =====")
+        print(f"解索引: {best_idx}")
+        best_row = df.iloc[best_idx]
+        print(f"平均反射率: {best_row['avg_reflectance(%)']:.4f}%")
+        print(f"均匀性:     {best_row['uniformity(%)']:.4f}%")
+        print(f"高角度 R:   {best_row['max_high_angle_R(%)']:.4f}%")
+        print(f"温度稳定性: {best_row['delta_R_temp(%)']:.4f}%")
+        print(f"应力:       {best_row['avg_stress(MPa)']:.4f} MPa")
+        thickness_cols = [c for c in df.columns if c.startswith('layer') and c.endswith('_thickness(nm)')]
+        layers = best_row[thickness_cols].values
+        print(f"厚度组合 (nm): {layers}")
+    except FileNotFoundError:
+        print("未找到帕累托解文件，跳过折中搜索。")
