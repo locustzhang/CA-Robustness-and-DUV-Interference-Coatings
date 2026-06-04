@@ -1,0 +1,2 @@
+base_avg_R,base_uniformity,base_max_R,mean_avg_R,std_avg_R,ci95_avg_R,mean_uniformity,std_uniformity,ci95_uniformity,mean_max_R,std_max_R,ci95_max_R,yield_rate,failure_rate
+1.3633,9.5037,1.5749,1.3721,0.1050,"[1.1676791477787944, 1.577723644118991]",11.8431,2.8484,"[7.770612462835083, 18.594507837179478]",1.7148,0.1316,"[1.491249666537549, 1.9861612651594605]",74.8000,25.2000
